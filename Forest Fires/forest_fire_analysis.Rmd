@@ -1,0 +1,786 @@
+---
+title: "Forest Fire Analyisis"
+output: html_notebook
+---
+
+Analysis of the UCI-ML forest fire data-set. Fires are located in the northeast region of Portugal, and the task is to predict the burned area due to a fire using meteorological and other data. https://archive.ics.uci.edu/ml/datasets/forest+fires, and the paper by Cortez and Morais (2007) is available here: https://repositorium.sdum.uminho.pt/bitstream/1822/8039/1/fires.pdf
+
+Libraries:
+```{r, warning = F, message = F}
+## data management and plotting
+library(tidyverse)
+library(lubridate)
+library(gridExtra)
+library(GGally)
+
+## analysis
+library(xgboost)
+library(Matrix)
+library(glmnet)
+```
+
+
+Read in the the data and check it out -I'll also include the Cortex and Morais transformation for the response variable $ln(\mbox{area}+1)$:
+```{r}
+fire_df <- read.csv("data/forestfires.csv", header = TRUE)
+
+## include log-transformation of response
+fire_df <- fire_df %>% mutate(areaT = log(area+1),
+                              month = fct_relevel(month, 
+                                                  'jan', 'feb', 'mar', 'apr', 
+                                                  'may', 'jun', 'jul', 'aug', 
+                                                  'sep','oct','nov','dec'),
+                              day = fct_relevel(day,
+                                                'sun', 'mon', 'tue', 'wed',
+                                                'thu', 'fri', 'sat'))
+
+str(fire_df)
+dim(fire_df)
+```
+
+We have 517 observations with 12 variables (with the dates combined). 
+
+Everything looks to be coded appropriately. Let's make a data dictionary for reference:
+
+1. `X` - x-axis spatial coordinate within the Montesinho park map: 1 to 9
+2. `Y` - y-axis spatial coordinate within the Montesinho park map: 2 to 9
+3. `month` - month of the year: 'jan' to 'dec'
+4. `day` - day of the week: 'mon' to 'sun'
+5. `FFMC` - FFMC index from the FWI system: 18.7 to 96.20
+6. `DMC` - DMC index from the FWI system: 1.1 to 291.3
+7. `DC` - DC index from the FWI system: 7.9 to 860.6
+8. `ISI` - ISI index from the FWI system: 0.0 to 56.10
+9. `temp` - temperature in Celsius degrees: 2.2 to 33.30
+10. `RH` - relative humidity in %: 15.0 to 100
+11. `wind` - wind speed in km/h: 0.40 to 9.40
+12. `rain` - outside rain in mm/m2 : 0.0 to 6.4
+13. `area` - the burned area of the forest (in ha): 0.00 to 1090.84
+14. `areaT` - transformed area variable $ln(\mbox{area}+1)$
+
+## EDA
+
+Let's begin by making a few plots. The documentation suggests the response variable `area` is heavily skewed toward zero. The plots below suggest the high degree of skewness with an without the zeros, but the author's transformation seems to help manage the skewed response data.
+
+```{r}
+grid.arrange(ggplot(data = fire_df, aes(x = area)) + 
+               geom_histogram(bins = 50) + 
+               ggtitle('All Data'), 
+             ggplot(data = fire_df %>% filter(area > 0), aes(x = area)) + 
+               geom_histogram(bins = 50) +
+               ggtitle('Non-Zero Values'),
+             ggplot(data = fire_df, aes(x = areaT)) + 
+               geom_histogram(bins = 50) + 
+               ggtitle('All Data with Transformation'), 
+             ggplot(data = fire_df %>% filter(area > 0), aes(x = areaT)) + 
+               geom_histogram(bins = 50) +
+               ggtitle('Non-Zero Values with Transformation'),
+             ncol = 2, nrow = 2)
+```
+
+### Spatial Variation of Response:
+
+Let's examine if any spatial variation occurs. For each grid location the total transformed response, average transformed response, and standard deviation will be computed.
+
+```{r, fig.height=10, fig.width=7}
+spat.dist <- fire_df %>% group_by(X, Y) %>% summarise(areaTot = sum(areaT),
+                                                      areaMean = mean(areaT),
+                                                      areaSD = sd(areaT))
+
+grid.arrange(
+  ggplot(data = spat.dist, aes(x = X, y = Y, fill = areaTot)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("Cumulative Distribution of Fire"),
+  ggplot(data = spat.dist, aes(x = X, y = Y, fill = areaMean)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("Average Distribution of Fire"),
+  ggplot(data = spat.dist, aes(x = X, y = Y, fill = areaSD)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("S.D. Distribution of Fire"),
+  nrow = 3
+)
+```
+
+Some spatial dependence is present -especially when considering the cumulative area. We can also see in the last panel (with SD plotted) some areas have more variation than others and is generally correlated with lowers cumulative or average burn areas.
+
+
+### Temporal Variation of Response
+
+Let's examine if any temporal dependence is present on the transformed response variable:
+
+```{r, fig.height=7, fig.width=7}
+grid.arrange(ggplot(data = fire_df, aes(x = month, y = areaT, fill = month)) +
+               geom_boxplot() +
+               theme(legend.position = "none") +
+               xlab('Month') + ylab('Trans. Area') +
+               ggtitle('Fire Area by Month'),
+             ggplot(data = fire_df, aes(x = day, y = areaT, fill = day)) +
+               geom_boxplot() +
+               theme(legend.position = "none")+
+               xlab('Day') + ylab('Trans. Area') +
+               ggtitle('Fire Area by Day'),
+             nrow = 2
+)
+```
+
+There is some dependence on month: May tends to be higher as well as December (perhaps it is very dry in December?). There appears to be minimal dependence on day of week. We also might want to get rid of the zeros to inspect the temporal dependence (eg. fires as a function of time given a fire burned some amount of area)
+
+```{r, fig.height=7, fig.width=7}
+grid.arrange(ggplot(data = fire_df %>% filter(areaT > 0), 
+                    aes(x = month, y = areaT, fill = month)) +
+               geom_boxplot() +
+               theme(legend.position = "none") +
+               xlab('Month') + ylab('Trans. Area') +
+               ggtitle('Fire Area by Month'),
+             ggplot(data = fire_df %>% filter(areaT > 0), 
+                    aes(x = day, y = areaT, fill = day)) +
+               geom_boxplot() +
+               theme(legend.position = "none")+
+               xlab('Day') + ylab('Trans. Area') +
+               ggtitle('Fire Area by Day'),
+             nrow = 2
+)
+```
+
+We have roughly the same observation for day of week -maybe it decreases in the middle of the week (e.g. Wednesday). The variability in burn area increases later in the summer, but the mean area stays roughly the same by month of the year. 
+
+### Relationship with other Variables
+
+Let's examine a pairs plot (with the geographic and temporal variables remove for now) and see if the climate/meteorological affect the burn area.
+
+```{r, message = F}
+ggpairs(fire_df %>% select(areaT, FFMC, DMC, DC, ISI, temp, RH, wind, rain))
+```
+
+There appears to be correlation among the fire index variables and weather variables (this makes sense since these fire indexes and climate variables are related to each other described in Fig. 1 of the author's paper), but nothing very strongly correlated with the transformed area variable. Let's take a closer look at `areaT` versus the the other variables and color according to month:
+s
+```{r, fig.height=10, fig.width = 8}
+grid.arrange(ggplot(data = fire_df, aes(x = FFMC, y = areaT, color = month)) + geom_point(),
+             ggplot(data = fire_df, aes(x = DMC, y = areaT, color = month)) + geom_point(),
+             ggplot(data = fire_df, aes(x = DC, y = areaT, color = month)) + geom_point(),
+             ggplot(data = fire_df, aes(x = ISI, y = areaT, color = month)) + geom_point(),
+             ggplot(data = fire_df, aes(x = RH, y = areaT, color = month)) + geom_point(),
+             ggplot(data = fire_df, aes(x = temp, y = areaT, color = month)) + geom_point(),
+             ggplot(data = fire_df, aes(x = wind, y = areaT, color = month)) + geom_point(),
+             ggplot(data = fire_df, aes(x = rain, y = areaT, color = month)) + geom_point(),
+             nrow = 4, ncol = 2)
+```
+
+Temporal effects also seem to strongly influence `FFMC`, `DMC`, `DC`, and `ISI` (notice the stratification by month as these indies change).
+
+Let's take a look at the spatial distribution of the fire index variables and the climate variables (like we did with the transformed area variable) and see if anything is spatially related. The mean value for each pair of coordinates is calculated for climate variable:
+
+```{r}
+climate.dist <- fire_df %>% group_by(X, Y) %>% summarise(FFMCm = mean(FFMC),
+                                                         DMCm = mean(DMC),
+                                                         DCm = mean(DC),
+                                                         ISIm = mean(ISI),
+                                                         RHm = mean(RH),
+                                                         tempm = mean(temp),
+                                                         windm = mean(wind),
+                                                         rainm = mean(rain))
+
+grid.arrange(
+  ggplot(data = climate.dist, aes(x = X, y = Y, fill = FFMCm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("FFCM Distribution"),
+  ggplot(data = climate.dist, aes(x = X, y = Y, fill = DMCm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("DCM Distribution"),
+  ggplot(data = climate.dist, aes(x = X, y = Y, fill = DCm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("DC Distribution"),
+    ggplot(data = climate.dist, aes(x = X, y = Y, fill = ISIm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("ISI Distribution"),
+  nrow = 2, ncol = 2
+)
+
+grid.arrange(
+  ggplot(data = climate.dist, aes(x = X, y = Y, fill = RHm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("RH Distribution"),
+  ggplot(data = climate.dist, aes(x = X, y = Y, fill = tempm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("Temp Distribution"),
+  ggplot(data = climate.dist, aes(x = X, y = Y, fill = windm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("Wind Distribution"),
+  ggplot(data = climate.dist, aes(x = X, y = Y, fill = rainm)) +
+    geom_tile() +
+    scale_fill_gradient(low = 'blue', high = 'red') +
+    xlab("X-Coordinate") + ylab("Y-Coordinate") +
+    ggtitle("Rain Distribution"),
+  nrow = 2, ncol = 2
+)
+```
+
+There is some degree of spatial relationship among the fire-index and climate features, although, I find it difficult to glean any direct observations as to how they relate to the prevalence of fires. 
+
+
+## Modeling and Analysis
+
+Cortez and Morais (2007) consider four different combinations of feature:
+
+* STFWI: spatial, temporal, and the four fire-index measures (FFCM, DCM, DC, and ISI)
+* STM: spatial, temporal and four weather variables (RH, temp, wind, rain)
+* FWI: the four fire-index measures only
+* M: the four weather components only. 
+
+Let's model the data using the XGBoost frame-work and consider and regression with a squared error loss and regression with a Tweedie loss to account for the high degree of zero inflation of the data. A nice feature of boosting is the ability to examine the variable importance for each model allowing for some degree of interpretation. Let's also try fitting the data using all of the features with a LASSO model and and recycle the selected features into a boosted model and examine performance.   
+
+First let's re-scale the data:
+
+```{r}
+scale01 <- function(x){(x - min(x))/(max(x) - min(x))}
+
+fire_sc <- fire_df %>% mutate_at(c('X', 'Y', 'FFMC', 'DMC', 'DC', 'ISI', 'temp', 'RH', 'wind', 'rain'), scale01)
+head(fire_sc)
+```
+
+To use XGBoost we need to create XGBoost data matrices. Let's create matrices for each type of the feature combinations in addition to a matrix with all the features:
+
+```{r}
+## Data matrices
+mat.STWFI <- sparse.model.matrix( ~ X + Y + month + day + FFMC + DMC + DC + ISI, 
+                                 data = fire_sc)[,-1]
+
+mat.STM <- sparse.model.matrix( ~ X + Y + month + day + temp + RH + wind + rain,
+                               data = fire_sc)[,-1]
+
+mat.FWI <- sparse.model.matrix( ~ FFMC + DMC + DC + ISI,
+                               data = fire_sc)[,-1]
+
+mat.m <- sparse.model.matrix( ~ temp + RH + wind + rain,
+                              data = fire_sc)[,-1]
+
+mat.all <- sparse.model.matrix( ~ X + Y + month + day + FFMC + DMC + DC + ISI + temp + RH + wind + rain, 
+                                 data = fire_sc)[,-1]
+
+
+## Target Matrices
+targetT <- as.matrix(fire_sc$areaT)
+targetNT <- as.matrix(fire_sc$area)
+targetC <- as.matrix(ifelse(fire_sc$area > 0, 1, 0))
+```
+
+
+Let's write helper functions to perform a grid-search with the `xgb.cv` function. The `xgb.optim` uses cross-validation to compute the testing and training errors, and the `xgb.bestHP` fins the best $d$, $eta$ and number of rounds based on the results of cross-validation.
+
+```{r}
+## xgb.optim: Function to test different depths and learning rates
+## data: data matrix
+## targets: target values matrix
+## d.list: list of depth values
+## eta.list: list of learning rate values
+## n.folds: number of cross-validation folds
+## rounds: number of rounds to train
+## loss.type: type of loss function
+## returns a data frame of results
+
+xgb.optim <- function(data, targets, d.list, eta.list, rounds = 75, loss.type = 'reg:squarederror', folds = 15) {
+  
+  ## determine  number of combos of eta and d
+  max.len <- length(d.list) * length(eta.list)
+  
+  ## create data frame for storing results
+  optim.results <- data.frame(d = 1:max.len,
+                              eta =  1:max.len,
+                              nrounds =  1:max.len,
+                              train.error =  1:max.len,
+                              test.error =  1:max.len)
+  
+  ## assign an index to fill the results of optim.results
+  index.fill <- 1
+  
+  for (i in 1:length(d.list)) {
+    for(j in 1:length(eta.list)){
+      ## set up parameters for cv
+      params <- list(booster = 'gbtree', objective = loss.type,
+                     max_depth = d.list[i], eta = eta.list[j],
+                     gamma = 0, min_child_wight = 1, subsample = 1, colsample_bytree = 1)
+      
+      ## perform cross validation
+      cv.results <- xgb.cv(params = params,
+                           data = data,
+                           label = targets,
+                           nfold = folds,
+                           nrounds = rounds,
+                           verbose = 0 )
+      
+      ## get the evaluation log
+      cv.eval <- cv.results$evaluation_log
+      
+      colnames(cv.eval) <- c('iter', 'train_error_mean', 'train_error_sd', 'test_error_mean', 'test_error_sd')
+      
+      ## find where the test and training error are almost the same,
+      ## but test error >= training error
+      opti.index <- max(which(cv.eval$train_error_mean >= cv.eval$test_error_mean))
+      
+      ## if no values suit the condition then fill with bogus value i.e. -1
+      if(opti.index == -Inf){
+        optim.results[index.fill,]$d <- d.list[i]
+        optim.results[index.fill,]$eta <- eta.list[j]
+        optim.results[index.fill,]$nrounds <- NaN
+        optim.results[index.fill,]$train.error <- NaN
+        optim.results[index.fill,]$test.error <- NaN
+      }
+      
+      ## else get the best value and fill the results table
+      else{
+        opti.res <- cv.eval[opti.index,]
+        
+        optim.results[index.fill,]$d <- d.list[i]
+        optim.results[index.fill,]$eta <- eta.list[j]
+        optim.results[index.fill,]$nrounds <- opti.res$iter
+        optim.results[index.fill,]$train.error<- opti.res$train_error_mean
+        optim.results[index.fill,]$test.error <- opti.res$test_error_mean     
+      }
+      
+      index.fill <- index.fill + 1
+    }
+  }
+  
+  return(optim.results)
+}
+
+
+## xgb.bestHP: takes results from xgb.optim() and return the best hyperparameters
+
+xgb.bestHP <- function(results){
+  
+  results <- na.omit(results)
+  
+  ## allocte a data-frame to return the best values
+  return.df <- data.frame(d = NaN,
+                          eta = NaN,
+                          rounds = NaN,
+                          train.error = NaN,
+                          test.error = NaN)
+  
+  ## get row with minium testing error from results
+  best.hp <- results[which(results$test.error == min(results$test.error)), ]
+  
+  return.df$d <-  best.hp$d
+  return.df$eta <-  best.hp$eta
+  return.df$rounds <-  best.hp$nrounds
+  return.df$train.error <- best.hp$train.error
+  return.df$test.error <- best.hp$test.error
+  
+  return(return.df)
+
+}
+
+```
+
+
+### Regression-Type Analysis
+
+Now, lets find the best hyper-parameters for each of the feature sets:
+
+```{r, warning = F, message = F}
+## candidate hyper-parameters
+dvals <- c(2,3,4,5)
+etavals <- c(0.01, 0.03, 0.3)
+
+set.seed(2)
+## optimize
+STWFI.optim <- xgb.optim(data = mat.STWFI,
+                         targets = targetT,
+                         d.list = dvals,
+                         eta.list = etavals)
+
+STM.optim <- xgb.optim(data = mat.STM,
+                       targets = targetT,
+                       d.list = dvals,
+                       eta.list = etavals)
+
+FWI.optim <- xgb.optim(data = mat.FWI,
+                       targets = targetT,
+                       d.list = dvals,
+                       eta.list = etavals)
+
+m.optim <- xgb.optim(data = mat.m,
+                     targets = targetT,
+                     d.list = dvals,
+                     eta.list = etavals)
+
+all.optim <- xgb.optim(data = mat.all, 
+                       targets = targetT, 
+                       d.list = dvals, 
+                       eta.list = etavals)
+
+## get the optimum parameters
+
+(STWFI.hp <- xgb.bestHP(STWFI.optim))
+(STM.hp <- xgb.bestHP(STM.optim))
+(FWI.hp <- xgb.bestHP(FWI.optim))
+(m.hp <- xgb.bestHP(m.optim))
+(all.hp <- xgb.bestHP(all.optim))
+```
+
+
+Let's make a graph of the errors:
+
+```{r}
+error.df <- data.frame(vars = c('STWFI', 'STM', 'FWI', 'M', 'All'),
+                       train.error = c(STWFI.hp$train.error,
+                                       STM.hp$train.error,
+                                       FWI.hp$train.error,
+                                       m.hp$train.error,
+                                       all.hp$train.error),
+                       test.error = c(STWFI.hp$test.error,
+                                       STM.hp$test.error,
+                                       FWI.hp$test.error,
+                                       m.hp$test.error,
+                                       all.hp$test.error)) %>%
+  pivot_longer(!vars, names_to = "type", values_to = "error")
+
+ggplot(data = error.df, aes(x = vars, y = error, fill = type)) +
+  geom_bar(stat = 'identity', position = position_dodge()) +
+  ylab("MSE") + xlab("Model Variables")
+```
+
+
+Overall it seems like the STM model performs the best in the sense of smallest training/test-validation error. Given these values, we can fit XGBoost models to the data and assess variable importance:
+
+#### STWFI Model
+
+```{r}
+STWFI.mod <- xgboost(data = mat.STWFI, 
+               label = targetT, 
+               eta = 0.3, 
+               nrounds = 2,
+               max_depth = 2, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.STWFI), model = STWFI.mod)
+```
+
+
+#### STM Model
+
+```{r}
+STM.mod <- xgboost(data = mat.STM, 
+               label = targetT, 
+               eta = 0.03, 
+               nrounds = 28,
+               max_depth = 2, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.STM), model = STM.mod)
+```
+
+
+#### FWI Model
+
+```{r}
+FWI.mod <- xgboost(data = mat.FWI, 
+               label = targetT, 
+               eta = 0.03, 
+               nrounds = 25,
+               max_depth = 2, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.FWI), model = FWI.mod)
+```
+
+#### M Model
+
+```{r}
+m.mod <- xgboost(data = mat.m, 
+               label = targetT, 
+               eta = 0.03, 
+               nrounds = 2,
+               max_depth = 2, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.m), model = m.mod)
+```
+
+#### All Model
+
+```{r}
+all.mod <- xgboost(data = mat.all, 
+               label = targetT, 
+               eta = 0.03, 
+               nrounds = 12,
+               max_depth = 2, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.all), model = all.mod)
+```
+
+
+### Regression Models with a Tweedie Loss
+
+Now, let's try fitting models with a Tweedie loss function to see if accounting for the zero-inflation has an effect on the behavior of the models:
+
+```{r, warning = F, message = F}
+set.seed(2)
+
+dvals <- c(2,3,4,5)
+etavals <- c(0.001, 0.01, 0.03, 0.3)
+## optimize
+STWFI.optimT <- xgb.optim(data = mat.STWFI,
+                          targets = targetT,
+                          d.list = dvals,
+                          eta.list = etavals,
+                          rounds = 25,
+                          loss.type = 'reg:tweedie')
+
+STM.optimT <- xgb.optim(data = mat.STM,
+                       targets = targetT,
+                       d.list = dvals,
+                       eta.list = etavals,
+                       rounds = 25,
+                       loss.type = 'reg:tweedie')
+
+FWI.optimT <- xgb.optim(data = mat.FWI,
+                       targets = targetT,
+                       d.list = dvals,
+                       eta.list = etavals,
+                       rounds = 25,
+                       loss.type = 'reg:tweedie')
+
+m.optimT <- xgb.optim(data = mat.m,
+                     targets = targetT,
+                     d.list = dvals,
+                     eta.list = etavals,
+                     rounds = 25,
+                     loss.type = 'reg:tweedie')
+
+all.optimT <- xgb.optim(data = mat.all, 
+                       targets = targetT, 
+                       d.list = dvals, 
+                       eta.list = etavals,
+                       rounds = 25,
+                       loss.type = 'reg:tweedie')
+
+## get the optimum parameters
+
+(STWFI.hpT <- xgb.bestHP(STWFI.optimT))
+(STM.hpT <- xgb.bestHP(STM.optimT))
+(FWI.hpT <- xgb.bestHP(FWI.optimT))
+(m.hpT <- xgb.bestHP(m.optimT))
+(all.hpT <- xgb.bestHP(all.optimT))
+```
+
+
+Let's make a graph of the errors:
+
+```{r}
+errorT.df <- data.frame(vars = c('STWFI', 'STM', 'FWI', 'M', 'All'),
+                       train.error = c(STWFI.hpT$train.error,
+                                       STM.hpT$train.error,
+                                       FWI.hpT$train.error,
+                                       m.hpT$train.error,
+                                       all.hpT$train.error),
+                       test.error = c(STWFI.hpT$test.error,
+                                       STM.hpT$test.error,
+                                       FWI.hpT$test.error,
+                                       m.hpT$test.error,
+                                       all.hpT$test.error)) %>%
+  pivot_longer(!vars, names_to = "type", values_to = "error")
+
+ggplot(data = errorT.df, aes(x = vars, y = error, fill = type)) +
+  geom_bar(stat = 'identity', position = position_dodge()) +
+  ylab("Log-Lik") + xlab("Model Variables")
+```
+
+Overall it seems like the M model performs the best in the sense of smallest error followed by the STM model. Given these values, we can fit XGBoost models to the data and assess variable importance:
+
+#### STWFI Model
+
+```{r}
+STWFI.modT <- xgboost(data = mat.STWFI, 
+               label = targetT, 
+               eta = 0.01, 
+               nrounds = 1,
+               max_depth = 4, 
+               objective = 'reg:tweedie',
+               verbose = 0)
+
+xgb.importance(colnames(mat.STWFI), model = STWFI.modT)
+```
+
+
+#### STM Model
+
+```{r}
+STM.modT <- xgboost(data = mat.STM, 
+               label = targetT, 
+               eta = 0.01, 
+               nrounds = 2,
+               max_depth = 4, 
+               objective = 'reg:tweedie',
+               verbose = 0)
+
+xgb.importance(colnames(mat.STM), model = STM.modT)
+```
+
+
+#### FWI Model
+
+```{r}
+FWI.modT <- xgboost(data = mat.FWI, 
+               label = targetT, 
+               eta = 0.01, 
+               nrounds = 4,
+               max_depth = 3, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.FWI), model = FWI.modT)
+```
+
+#### M Model
+
+```{r}
+m.modT <- xgboost(data = mat.m, 
+               label = targetT, 
+               eta = 0.03, 
+               nrounds = 2,
+               max_depth = 4, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.m), model = m.modT)
+```
+
+#### All Model
+
+```{r}
+all.modT <- xgboost(data = mat.all, 
+               label = targetT, 
+               eta = 0.01, 
+               nrounds = 25,
+               max_depth = 3, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.all), model = all.modT)
+```
+
+We can compare the MSE's from two competing types of models for the the best performing models for each type of response category. For example the two models that incorporate all the explanatory variables:
+
+```{r}
+un.T <- function(x){exp(x) - 1}
+
+mean(abs(targetNT - un.T(predict(STM.mod, mat.STM))))
+sqrt(mean((targetNT - un.T(predict(STM.mod, mat.STM)))^2))
+mean(abs(targetNT - un.T(predict(m.modT, mat.m))))
+sqrt(mean((targetNT - un.T(predict(m.modT, mat.m)))^2))
+
+```
+
+We generally get better performance (in the sense of smallest MSE) for models optimized with a squared error loss function with the STM variables utilized, i.e. spatial, temporal, and meteorological.
+
+
+### Regression with the LASSO
+
+Using all of the variables, we can treat this a a variable selection problem with the LASSo using the `nnet` package to produce a model. (See a text like ISLR or ESLR for more info.) Fortunately we already have the matrices prepared for fitting:
+
+
+```{r}
+fit <- glmnet(mat.all, targetT)
+
+## the plotmo package provides a nicer plot for the glmnet models (I think):
+plotmo::plot_glmnet(fit)
+```
+
+The `cv.glmnet` performs cross validation to obtain the optimum regularization parameter (which turns out to be about 0.08):
+
+```{r}
+set.seed(2)
+cvfit <- cv.glmnet(mat.all, targetT)
+plot(cvfit)
+cvfit$lambda.min
+```
+
+Using the optimum lambda from cross validation we can obtian the the selected variables, and the MAE and MSE scores: 
+
+```{r}
+coef(cvfit, s = 'lambda.min')
+
+mean(abs(targetNT - un.T(predict(cvfit, mat.all, s = 'lambda.min'))))
+sqrt(mean((targetNT - un.T(predict(cvfit, mat.all, s = 'lambda.min')))^2))
+```
+
+The selected variables are: X, month, DMC, and temperature. The performance metrics are slightly higher than the best boosed models. It might be interesting to examine if using the variables selected by LASSO regression in a boosted model allows for an improvement of performance: 
+
+```{r,warning=FALSE,message=FALSE}
+## prepare custom data matrix:
+mat.cust <- sparse.model.matrix( ~ X + month + DMC +  temp, 
+                                 data = fire_sc)[,-1]
+
+## optimize hyper-parameters
+dvals <- c(2,3,4,5)
+etavals <- c(0.01, 0.03, 0.3)
+
+set.seed(2)
+## optimize
+cust.optim <- xgb.optim(data = mat.cust,
+                         targets = targetT,
+                         d.list = dvals,
+                         eta.list = etavals)
+
+(cust.hpT <- xgb.bestHP(cust.optim))
+
+```
+
+We still have better performance with the STM model, but let's fit a full model with the cusom variables:
+
+```{r}
+cust.mod <- xgboost(data = mat.cust, 
+               label = targetT, 
+               eta = 0.03, 
+               nrounds = 17,
+               max_depth = 2, 
+               objective = 'reg:squarederror',
+               verbose = 0)
+
+xgb.importance(colnames(mat.cust), model = cust.mod)
+
+## error metrics
+mean(abs(targetNT - un.T(predict(cust.mod, mat.cust))))
+sqrt(mean((targetNT - un.T(predict(cust.mod, mat.cust)))^2))
+```
+
+This feature selection set-up does not provide any advantages over the STM model in the sense of smaller error metrics. 
+
+
+
+
+
+
+
+
+
+
+
+
